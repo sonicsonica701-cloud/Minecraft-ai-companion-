@@ -1,0 +1,116 @@
+name: Llev Funnel API v8
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "How long to keep the temporary API alive, max 120"
+        required: true
+        default: "120"
+      hostname_suffix:
+        description: "Optional Tailscale hostname suffix"
+        required: false
+        default: "llev-api"
+
+permissions:
+  contents: write
+
+jobs:
+  approved-api:
+    runs-on: windows-latest
+    timeout-minutes: 130
+    steps:
+      - name: Check required secrets
+        shell: pwsh
+        run: |
+          if (-not "${{ secrets.TAILSCALE_AUTH_KEY }}") { Write-Error "Missing TAILSCALE_AUTH_KEY"; exit 1 }
+          if (-not "${{ secrets.LLEV_API_KEY }}") { Write-Error "Missing LLEV_API_KEY"; exit 1 }
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+      - name: Connect to Tailscale
+        shell: pwsh
+        run: |
+          $suffix = "${{ github.event.inputs.hostname_suffix }}"
+          if (-not $suffix) { $suffix = "llev-api" }
+          $hostname = "gh-$suffix-${{ github.run_id }}"
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$hostname
+          Start-Sleep -Seconds 5
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" status
+      - name: Start tiny approved API
+        shell: pwsh
+        env:
+          LLEV_API_KEY: ${{ secrets.LLEV_API_KEY }}
+        run: |
+          @'
+          const http = require('http');
+          const fs = require('fs');
+          const path = require('path');
+          const cp = require('child_process');
+          const apiKey = process.env.LLEV_API_KEY || '';
+          const workspace = process.env.GITHUB_WORKSPACE || process.cwd();
+          const started = Date.now();
+          function send(res, status, obj) {
+            const body = JSON.stringify(obj, null, 2);
+            res.writeHead(status, {'content-type': 'application/json', 'content-length': Buffer.byteLength(body)});
+            res.end(body);
+          }
+          http.createServer((req, res) => {
+            if (req.headers['x-api-key'] !== apiKey) return send(res, 401, {error:'unauthorised'});
+            const url = new URL(req.url, 'http://127.0.0.1');
+            if (url.pathname === '/health') return send(res, 200, {status:'ok', uptime_seconds: Math.floor((Date.now()-started)/1000)});
+            if (url.pathname === '/system-info') return send(res, 200, {hostname: process.env.COMPUTERNAME, platform: process.platform, node: process.version, workspace});
+            if (url.pathname === '/repo-files') return send(res, 200, {items: fs.readdirSync(workspace).slice(0,100).map(name => ({name, type: fs.statSync(path.join(workspace, name)).isDirectory() ? 'folder' : 'file'}))});
+            if (url.pathname === '/repo-status') {
+              try { const out = cp.execSync('git status --short', {cwd: workspace, encoding:'utf8'}); return send(res, 200, {stdout: out, returncode: 0}); }
+              catch (e) { return send(res, 200, {stdout: e.stdout?.toString() || '', stderr: e.stderr?.toString() || e.message, returncode: e.status || 1}); }
+            }
+            return send(res, 404, {error:'not found', allowed:['/health','/system-info','/repo-files','/repo-status']});
+          }).listen(8787, '127.0.0.1', () => console.log('Llev API listening on 127.0.0.1:8787'));
+          '@ | Set-Content -Path "$env:RUNNER_TEMP\llev_api.js" -Encoding UTF8
+          Start-Process -FilePath node -ArgumentList "$env:RUNNER_TEMP\llev_api.js" -WindowStyle Hidden
+          Start-Sleep -Seconds 3
+          curl.exe --max-time 5 -H "x-api-key: $env:LLEV_API_KEY" http://127.0.0.1:8787/health
+      - name: Save integration info and start Tailscale Funnel
+        shell: pwsh
+        run: |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $status = & $ts status --json | ConvertFrom-Json
+          $dns = $status.Self.DNSName.TrimEnd('.')
+          $baseUrl = "https://$dns"
+          [ordered]@{
+            name = "Llev Runner API"
+            baseUrl = $baseUrl
+            authStyle = "api_key_header"
+            authHeader = "x-api-key"
+            safeTestPath = "/health"
+            availablePaths = @("/health", "/system-info", "/repo-files", "/repo-status")
+            runId = "${{ github.run_id }}"
+            createdAt = (Get-Date).ToUniversalTime().ToString("o")
+          } | ConvertTo-Json -Depth 5 | Set-Content -Path "llev-funnel-info.json" -Encoding UTF8
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git pull --rebase origin main
+          git add llev-funnel-info.json
+          git commit -m "Update Llev Funnel integration info" || echo "No changes"
+          git push origin HEAD:main || echo "Push failed"
+          Write-Host "CUSTOM_INTEGRATION_BASE_URL=$baseUrl"
+          & $ts funnel --yes --bg localhost:8787
+      - name: Keep temporary API alive
+        shell: pwsh
+        run: |
+          $minutes = [int]"${{ github.event.inputs.duration_minutes }}"
+          if ($minutes -gt 120) { $minutes = 120 }
+          if ($minutes -lt 1) { $minutes = 1 }
+          $end = (Get-Date).AddMinutes($minutes)
+          while ((Get-Date) -lt $end) {
+            Write-Host "[$(Get-Date)] Llev approved API active"
+            Start-Sleep -Seconds 60
+          }
