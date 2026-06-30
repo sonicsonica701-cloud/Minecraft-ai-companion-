@@ -1,0 +1,163 @@
+name: Llev Funnel API v3
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "How long to keep the temporary API alive, max 120"
+        required: true
+        default: "30"
+      hostname_suffix:
+        description: "Optional Tailscale hostname suffix"
+        required: false
+        default: "llev-api"
+
+jobs:
+  approved-api:
+    runs-on: windows-latest
+    timeout-minutes: 130
+
+    steps:
+      - name: Check required secrets
+        shell: pwsh
+        run: |
+          $missing = @()
+          if (-not "${{ secrets.TAILSCALE_AUTH_KEY }}") { $missing += "TAILSCALE_AUTH_KEY" }
+          if (-not "${{ secrets.LLEV_API_KEY }}") { $missing += "LLEV_API_KEY" }
+          if ($missing.Count -gt 0) {
+            Write-Host "Missing required repository secret(s): $($missing -join ', ')"
+            Write-Host "Add them in: Repo > Settings > Secrets and variables > Actions > New repository secret"
+            Write-Host "Do not paste secret values into chat."
+            exit 1
+          }
+
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Connect to Tailscale
+        shell: pwsh
+        run: |
+          $suffix = "${{ github.event.inputs.hostname_suffix }}"
+          if (-not $suffix) { $suffix = "llev-api" }
+          $hostname = "gh-$suffix-${{ github.run_id }}"
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$hostname
+          Start-Sleep -Seconds 5
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" status
+          $status = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json | ConvertFrom-Json
+          $dns = $status.Self.DNSName.TrimEnd('.')
+          $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          Write-Host "TAILSCALE_HOSTNAME=$hostname"
+          Write-Host "TAILSCALE_DNS=$dns"
+          Write-Host "TAILSCALE_IP=$ip"
+
+      - name: Create tiny approved API
+        shell: pwsh
+        env:
+          LLEV_API_KEY: ${{ secrets.LLEV_API_KEY }}
+        run: |
+          @'
+          import json, os, platform, socket, subprocess, time
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          from urllib.parse import urlparse
+
+          API_KEY = os.environ.get("LLEV_API_KEY", "")
+          STARTED = time.time()
+          WORKSPACE = os.environ.get("GITHUB_WORKSPACE", os.getcwd())
+
+          def safe_json(handler, status, payload):
+              body = json.dumps(payload, indent=2).encode("utf-8")
+              handler.send_response(status)
+              handler.send_header("content-type", "application/json")
+              handler.send_header("content-length", str(len(body)))
+              handler.end_headers()
+              handler.wfile.write(body)
+
+          def run_approved(args, timeout=10):
+              result = subprocess.run(args, cwd=WORKSPACE, capture_output=True, text=True, timeout=timeout)
+              return {
+                  "returncode": result.returncode,
+                  "stdout": result.stdout[-4000:],
+                  "stderr": result.stderr[-2000:],
+              }
+
+          class Handler(BaseHTTPRequestHandler):
+              def authorised(self):
+                  return API_KEY and self.headers.get("x-api-key") == API_KEY
+
+              def do_GET(self):
+                  if not self.authorised():
+                      return safe_json(self, 401, {"error": "unauthorised"})
+
+                  route = urlparse(self.path).path
+
+                  if route == "/health":
+                      return safe_json(self, 200, {"status": "ok", "uptime_seconds": int(time.time() - STARTED)})
+
+                  if route == "/system-info":
+                      return safe_json(self, 200, {
+                          "hostname": socket.gethostname(),
+                          "platform": platform.platform(),
+                          "python": platform.python_version(),
+                          "workspace": WORKSPACE,
+                      })
+
+                  if route == "/repo-files":
+                      items = []
+                      for name in sorted(os.listdir(WORKSPACE))[:100]:
+                          full = os.path.join(WORKSPACE, name)
+                          items.append({"name": name, "type": "folder" if os.path.isdir(full) else "file"})
+                      return safe_json(self, 200, {"items": items})
+
+                  if route == "/repo-status":
+                      return safe_json(self, 200, run_approved(["git", "status", "--short"]))
+
+                  return safe_json(self, 404, {"error": "not found", "allowed": ["/health", "/system-info", "/repo-files", "/repo-status"]})
+
+              def log_message(self, fmt, *args):
+                  print("api", self.address_string(), fmt % args)
+
+          ThreadingHTTPServer(("127.0.0.1", 8787), Handler).serve_forever()
+          '@ | Set-Content -Path "$env:RUNNER_TEMP\llev_api.py" -Encoding UTF8
+          Start-Process -FilePath python -ArgumentList "$env:RUNNER_TEMP\llev_api.py" -WindowStyle Hidden
+          Start-Sleep -Seconds 3
+          Invoke-WebRequest -UseBasicParsing -Headers @{"x-api-key" = $env:LLEV_API_KEY} http://127.0.0.1:8787/health
+
+      - name: Expose API with Tailscale Funnel and print integration info
+        shell: pwsh
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" funnel --bg --yes http://127.0.0.1:8787
+          Start-Sleep -Seconds 3
+          $status = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json | ConvertFrom-Json
+          $dns = $status.Self.DNSName.TrimEnd('.')
+          Write-Host ""
+          Write-Host "===== LLEVERAGE CUSTOM INTEGRATION INFO ====="
+          Write-Host "CUSTOM_INTEGRATION_NAME=Llev Runner API"
+          Write-Host "CUSTOM_INTEGRATION_BASE_URL=https://$dns"
+          Write-Host "AUTH_STYLE=API key header"
+          Write-Host "AUTH_HEADER=x-api-key"
+          Write-Host "SAFE_TEST_PATH=/health"
+          Write-Host "AVAILABLE_PATHS=/health,/system-info,/repo-files,/repo-status"
+          Write-Host "============================================"
+          Write-Host ""
+          Write-Host "Send Llev only the CUSTOM_INTEGRATION_BASE_URL. Do not send the API key."
+
+      - name: Keep temporary API alive
+        shell: pwsh
+        run: |
+          $minutes = [int]"${{ github.event.inputs.duration_minutes }}"
+          if ($minutes -gt 120) { $minutes = 120 }
+          if ($minutes -lt 1) { $minutes = 1 }
+          $end = (Get-Date).AddMinutes($minutes)
+          while ((Get-Date) -lt $end) {
+            Write-Host "[$(Get-Date)] Llev approved API active"
+            Start-Sleep -Seconds 60
+          }
